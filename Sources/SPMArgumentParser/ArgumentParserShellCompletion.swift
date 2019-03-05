@@ -58,7 +58,13 @@ extension ArgumentParser {
                 #
 
                 """
-            generateFishSwiftTool(name: name, on: stream)
+            let fishCommandName: String
+            if commandName.contains(" ") {
+                fishCommandName = "'\(commandName)'"
+            } else {
+                fishCommandName = commandName
+            }
+            generateFishSwiftTool(name: String(name.dropFirst()), command: fishCommandName, on: stream)
         }
         stream.flush()
     }
@@ -287,7 +293,7 @@ extension ArgumentParser {
 
     // MARK: - Fish
 
-    fileprivate func generateFishSwiftTool(name: String, on stream: OutputByteStream) {
+    fileprivate func generateFishSwiftTool(name: String, command: String, on stream: OutputByteStream) {
         let hasSubcommands = self.subparsers.count > 0
         if hasSubcommands {
             generateFishSubcommandFilters(name: name, on: stream)
@@ -295,14 +301,20 @@ extension ArgumentParser {
 
         // Generate completions for the basic options at this level.
         for argument in optionArguments {
-            generateFishCompletion(argument, for: name, on: stream)
+            stream <<< "complete -c \(command)"
+            if hasSubcommands {
+                stream <<< " -n '__fish_\(name)_needs_command'"
+            }
+            generateFishCompletion(argument, on: stream)
+            stream <<< "\n"
         }
 
         // Fish completion doesn't seem to have any way to offer completions for positional options...
 
         // Generate subparsers.
         for (subname, subparser) in subparsers {
-            generateFishSubparserCompletions(commandName: name, subname: subname, parser: subparser, on: stream)
+            generateFishSubparserCompletions(commandName: command, funcName: name,
+                                             subname: subname, parser: subparser, on: stream)
         }
     }
 
@@ -338,25 +350,52 @@ extension ArgumentParser {
             """
     }
 
-    fileprivate func generateFishCompletion(_ argument: AnyArgument, for name: String, on stream: OutputByteStream) {
-        let requiresArgument = argument.kind == Bool.self && argument.strategy == .oneByOne
-        let fileExclusiveArg: String
+    fileprivate func stripShortPrefix(from shortName: String) -> String {
+        // should be in the format "-s", meaning the letter we want is in the second character
+        return String(shortName.dropFirst())
+    }
+
+    fileprivate func stripLongPrefix(from argumentName: String) -> String {
+        return String(argumentName.dropFirst(2))
+    }
+
+    fileprivate func printFishDescription(_ description: String?, on stream: OutputByteStream) {
+        if let str = description, str.count > 0 {
+            let output = removeDefaultRegex
+                .replace(in: str, with: "")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+                .replacingOccurrences(of: "(", with: "\\(")
+                .replacingOccurrences(of: ")", with: "\\)")
+            stream <<< " -d \"\(output)\""
+        }
+    }
+
+    fileprivate func generateFishCompletion(_ argument: AnyArgument, on stream: OutputByteStream) {
+        let requiresArgument = !(argument.kind == Bool.self && argument.strategy == .oneByOne)
+
         if case .filename = argument.completion {
-            // allow filenames
-            fileExclusiveArg = ""
+            // allow filenames, no output for this
         } else if requiresArgument {
             // no filenames, requires argument == 'exclusive'
-            fileExclusiveArg = " -x"
+            stream <<< " -x"
         } else {
             // no filenames
-            fileExclusiveArg = " -f"
+            stream <<< " -f"
         }
 
-        stream <<< "complete\(fileExclusiveArg) -c \(name) -n '__fish_\(name)_needs_command'"
-        if let shortName = argument.shortName {
-            stream <<< " -s \(shortName)"
+        switch argument.completion {
+        case .filename, .unspecified, .none:
+            break
+        case .function(let fname):
+            stream <<< " -a '(\(fname))'"
+        case .values(let values):
+            stream <<< " -a \"\(values.map({ $0.0 }).joined(separator: " "))\""
         }
-        stream <<< " -l \(name)"
+
+        if let shortName = argument.shortName {
+            stream <<< " -s \(stripShortPrefix(from: shortName))"
+        }
+        stream <<< " -l \(stripLongPrefix(from: argument.name))"
         if requiresArgument {
             stream <<< " -r"
         }
@@ -364,14 +403,8 @@ extension ArgumentParser {
         if case let .values(values) = argument.completion {
             stream <<< " -a \"\(values.map({ $0.0 }).joined(separator: " "))\""
         }
-        if let usage = argument.usage {
-            let description = removeDefaultRegex
-                .replace(in: usage, with: "")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-                .replacingOccurrences(of: "(", with: "\\(")
-                .replacingOccurrences(of: ")", with: "\\)")
-            stream <<< " -d \"\(description)\""
-        }
+
+        printFishDescription(argument.usage, on: stream)
     }
 
     fileprivate func generateFishOptsList(_ arguments: [AnyArgument]) -> [String] {
@@ -387,11 +420,12 @@ extension ArgumentParser {
         let optionsWithoutShortNames = arguments.filter { $0.shortName == nil }
 
         for argument in optionsWithShortNames {
-            guard availableCharacters.contains(argument.shortName!.first!) else {
-                fatalError("Short name is already in use: \(argument.shortName!)")
+            let sletter = argument.shortName!.dropFirst().first!
+            guard availableCharacters.contains(sletter) else {
+                fatalError("Short name is already in use: \(sletter)")
             }
-            var str = "\(argument.shortName!)/\(argument.name)"
-            availableCharacters.remove(argument.shortName!.first!)
+            var str = "\(sletter)/\(argument.name)"
+            availableCharacters.remove(sletter)
 
             if argument.kind != Bool.self {
                 str += "="
@@ -426,10 +460,75 @@ extension ArgumentParser {
         return completions
     }
 
-    fileprivate func generateFishSubparserCompletions(commandName: String, subname: String, parents: [String] = [],
+    fileprivate func generateFishSubparserCompletions(commandName: String, funcName: String, subname: String,
                                                       parser: ArgumentParser, on stream: OutputByteStream) {
         // Completion for the subparser command itself.
-        
+        // set -l subcommands <parser.subparsers.names>
+        // complete -f -c <commandName> -n "__fish_<commandName>_needs_command" -a <subname> -d <overview>
+        // complete -f -c <commandName> -n "__fish_<commandName>_using_command <subname>" -a '<parser.subparsers.names>'
+        // complete -f -c <commandName> -n "__fish_<commandName>_using_command <subname>; and not __fish_seen_subcommand_from $subcommands" -s <arg.short> -l <arg.long> -d <arg.usage>
+        // complete -f -c <commandName> -n "__fish_<commandName>_using_command <subname>; and fish_seen_subcommand_from <subparsers[i].name> " -s <short> -l <long> -d <desc>
+
+        if parser.subparsers.count > 0 {
+            let subcommands = parser.subparsers.map { $0.0 }
+            stream <<< "set -l \(commandName)_\(subname)_subcommands \(subcommands.joined(separator: " "))\n"
+        }
+
+        let overview = removeDefaultRegex
+            .replace(in: parser.overview, with: "")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "(", with: "\\(")
+            .replacingOccurrences(of: ")", with: "\\)")
+
+        // completion for the name of this subparser's command.
+        stream <<< "complete -f -c \(commandName) -n '__fish_\(commandName)_needs_command' -a \(subname)"
+        stream <<< " -d \"\(overview)\"\n"
+
+        // Now for each subcommand option.
+        // Our condition will change based on whether we need to consider further sub-commands below this one.
+        var condition: String
+        if parser.subparsers.count > 0 {
+            condition = "\"__fish_\(commandName)_using_command \(subname); and not __fish_seen_subcommand_from $\(commandName)_\(subname)_subcommands\""
+        } else {
+            condition = "'__fish_\(commandName)_using_command \(subname)'"
+        }
+
+        // Print out the options.
+        for argument in parser.optionArguments {
+            stream <<< "complete -c \(commandName) -n \(condition)"
+            generateFishCompletion(argument, on: stream)
+            stream <<< "\n"
+        }
+
+        // if there are no sub-parsers here, we're done.
+        if parser.subparsers.isEmpty {
+            return
+        }
+
+        stream <<< "\n"
+
+        // Print out completions for each subcommand.
+        for (subcommand, subparser) in parser.subparsers {
+            stream <<< "complete -c \(commandName) -n \(condition) -a \(subcommand)"
+            printFishDescription(subparser.overview, on: stream)
+            stream <<< "\n"
+        }
+
+        // generate completions for each sub-parser.
+        for (subcommand, subparser) in parser.subparsers {
+            condition = "\"__fish_\(commandName)_using_command \(subname); and __fish_seen_subcommand_from \(subcommand) \""
+            for argument in subparser.optionArguments {
+                stream <<< "complete -c \(commandName) -n \(condition)"
+                generateFishCompletion(argument, on: stream)
+                stream <<< "\n"
+            }
+            stream <<< "\n"
+        }
+    }
+
+    fileprivate func generateFishNestedSubparserCompletions(name: String, condition: String, parser: ArgumentParser,
+                                                            on stream: OutputByteStream) {
+
     }
 }
 

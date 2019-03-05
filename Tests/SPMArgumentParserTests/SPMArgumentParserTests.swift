@@ -325,7 +325,7 @@ final class SPMArgumentParserTests: XCTestCase {
     }
 
     func testSubsubparser() throws {
-        let parser = ArgumentParser(usage: "sample parser", overview: "Sample overview")
+        let parser = ArgumentParser(commandName: "example", usage: "sample parser", overview: "Sample overview")
 
         let parserA = parser.add(subparser: "foo", overview: "A!")
         let branchOption = parserA.add(option: "--branch", kind: String.self)
@@ -529,6 +529,15 @@ final class SPMArgumentParserTests: XCTestCase {
                 _arguments $arguments && return
             }
 
+
+            """))
+
+        output = BufferedOutputByteStream()
+        parser.generateCompletionScript(for: .fish, on: output)
+        XCTAssertEqual(output.bytes, ByteString(encodingAsUTF8: """
+            # Generates completions for SomeBinary
+            #
+            complete -c SomeBinary -x -l revision -r -d "The revision[Experimental]"
 
             """))
     }
